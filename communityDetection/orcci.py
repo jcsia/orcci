@@ -11,6 +11,7 @@ Reference:
 
 """
 
+import itertools
 import time
 import operator
 import networkx as nx
@@ -127,7 +128,7 @@ def detection_accuracy(G, truth_label, detect_label, verbose=False):
     return accuracy, common_set
 
 
-def orcci(G, weight='weight', method='Sinkhorn', edges_known=[], block_label="blockRicci",
+def orcci(G, weight='weight', method='Sinkhorn', nodes_known=[], block_label="blockRicci", sinfo_label="block",
                 max_cores=16, verbose="ERROR"):
     """
     Community detection using Ollivier-Ricci curvature with known side information.
@@ -140,10 +141,12 @@ def orcci(G, weight='weight', method='Sinkhorn', edges_known=[], block_label="bl
         Method type for (Wasserstein) distance calculation. Default: 'Sinkhorn' ot approximation. Other
         possible values: 'OTD' - exact optimal transport calculation via linear programming; "ATD" for Average
         Transportation Distance.
-    :param edges_known: (list: edge tuple)
-        Edge list of known side information
+    :param nodes_known: (list: node) 
+        Node list of nodes with known side information (community labels)
     :param block_label: (str)
         Label for the discovered "block" or community
+    :param sinfo_label: (str)
+        Label for the side information/ground truth e.g. "block" for SBM or "pathway" for gene/protein interaction networks
     :param max_cores: (int)
         Number of allowed maximum cores.
     :param verbose: (str) = {"INFO", "TRACE","DEBUG","ERROR"}
@@ -166,7 +169,12 @@ def orcci(G, weight='weight', method='Sinkhorn', edges_known=[], block_label="bl
     TODO Batch version (greedy approach?)
     TODO Set number of threads explicitly
     TODO Unweighted (created edge weight attribute as 1.0)
+    TODO Edge flag for side information or prevention of creating small islands
+    TODO Optional Force removal of edges known to belong to different communities
     """
+#     :param edges_known: (list: edge tuple)  # TODO: change to nodes_known
+#         Edge list of known side information
+
     t0 = time.time()
 
     MIN_TOL = -0.1  # Minimum tolerance for edge ORC
@@ -198,11 +206,6 @@ def orcci(G, weight='weight', method='Sinkhorn', edges_known=[], block_label="bl
 
     edge_list = []
 
-    # TODO Consider nodes_known instead of edges_known
-    # 2020.08.02 - Force positive ricci curvature for known edges (side information)
-    for k in edges_known:
-        G_prime[k[0]][k[1]]['ricciCurvature'] = 1
-
     if verbose == "TRACE":
         print("Network summary")
         print(nx.info(G))
@@ -212,6 +215,91 @@ def orcci(G, weight='weight', method='Sinkhorn', edges_known=[], block_label="bl
 
     while True:
         iter_ctr = iter_ctr + 1
+        
+        # initialization methods
+        # 2020.11.09 Moved side info processing here. TEMP
+        if iter_ctr == 1:
+            # 2020.11.09 Changed edges_known implementation to nodes_known
+            # ---- Implication: side information processing migrated to orcci
+            # ---- TODO: Create a sub-function for side-information processing, i.e. find_known_edges(.)
+
+            # label known nodes as '1', unknown nodes as '0'
+            # TODO: Optimize
+            for node in G_prime.nodes():
+                known = 0
+                if node in nodes_known:
+                    known = 1
+                G_prime.nodes[node]['known'] = known
+
+            # print(nodes_known)
+
+            # TODO: to update to a general multi-block network
+            # check if known nodes belonging to the same community have connection
+            known_partition = dict()  # {0: [], 1: [], 2: []}
+
+            edges_known = []  # list of all edges known based on known node side information
+            for i in nodes_known:
+                # TODO: Add catch if node don't have sinfo_label value
+                block = G_prime.nodes[i][sinfo_label]
+                insert_to_dict_list(known_partition, block, i)
+                # known_partition[block].append(i)
+
+            # print(known_partition)
+            
+            nx.set_edge_attributes(G_prime, 0, "known")
+            # TODO: use itertools to simplify for-loop combinations
+            # artificially create edge links between known nodes that belong to the same community (obsolete)
+            for i in known_partition:  # range(len(known_partition)) # block
+                for j in range(len(known_partition[i])):  # range(len(known_partition[i])) # node
+                    node_s = known_partition[i][j]
+                    for k in range(j + 1, len(known_partition[i])):
+                        node_d = known_partition[i][k]
+                        # Method 1: "STRONG" -- add edges
+                        # if not G_prime.has_edge(node_s, node_d):
+                        #     G_prime.add_edge(node_s, node_d, weight=1.0, ricciCurvature=1.0)
+                        # edges_known.append((node_s, node_d))
+
+                        # Method 2: "Default"
+                        if G_prime.has_edge(node_s, node_d):
+                            G_prime.edges[(node_s, node_d)]['known'] = 1
+                            edges_known.append((node_s, node_d))
+
+            # print(edges_known)
+            
+            
+            # calculate ORC for all edges at the first iteration
+            # TODO: needed?
+#             if not edge_list:
+#                 edge_list = list(G_prime.edges())  # 2020.07.31 - JCS changed to list
+            
+            orc_edges_dict = orc.compute_ricci_curvature_edges() #(edge_list=edge_list)
+            # G_prime = orc.G
+            nx.set_edge_attributes(G_prime, orc_edges_dict, 'ricciCurvature')
+            
+            # Copy of original network configuration with vanilla ORC values
+            # TODO: deepcopy orc Class instead?
+            # TODO: check if orc_orig is properly copied
+            orc_orig.G = deepcopy(orc.G)
+            G_orig = orc_orig.G
+            
+
+            # Added 2020.11.05 -- edge removals between nodes of different verified labels
+            # TODO: Catch for known_partition = []
+            for k1, k2 in itertools.combinations(known_partition, 2):
+                for pair in list(itertools.product(known_partition[k1],known_partition[k2])):
+                    if G_prime.has_edge(pair[0], pair[1]):
+                        # G_orig.edges[(node_s, node_d)]['known'] = -1
+                        G_prime.remove_edge(*pair)
+
+            # END
+
+            # 2020.08.02 - Force positive ricci curvature for known edges (side information)
+            # TODO: replace forced positive RC vs 'uncuttable' flag: Mark edge as "un-cuttable instead?"
+            for k in edges_known:
+                G_prime[k[0]][k[1]]['ricciCurvature'] = 1  
+
+            # END -- Side info processing
+            
 
         if verbose == "TRACE":
             print("========================================================")
@@ -221,8 +309,11 @@ def orcci(G, weight='weight', method='Sinkhorn', edges_known=[], block_label="bl
         if not edge_list:
             edge_list = list(G_prime.edges())  # 2020.07.31 - JCS changed to list
 
+        # print("edge_list (before removals): ", edge_list)
+
         # 2020.08.03 - JCS [TODO: optimize - implement flag instead]
         # remove known edges in edge_list for Ricci calculation
+        # saves unneeded computations of known edges
         for i in edge_list:
             for k in edges_known:
                 k_inv = (k[1], k[0])
@@ -230,106 +321,145 @@ def orcci(G, weight='weight', method='Sinkhorn', edges_known=[], block_label="bl
                     edge_list.remove(k)
                 elif k_inv in edge_list:
                     edge_list.remove(k_inv)
+                    
+        # print("edge_list (after removals): ", edge_list)
+    
+        # 2020.11.16 if edge_list not empty do the negative edge removal / else: all remaining edges are known and go to exit condition
+        if edge_list:
 
-        # print("edge_list: ", edge_list)
+            # 2020.08.29 - changed to OllivierRicci class (using latest graphRicciCurvature package)
+            # TODO: check if orc_orig is properly copied
+            # TODO: skip if iter==1?
 
-        # 2020.08.29 - changed to OllivierRicci class (using latest graphRicciCurvature package)
-        # TODO: check if orc_orig is properly copied
-        orc_edges_dict = orc.compute_ricci_curvature_edges(edge_list=edge_list)
-        # G_prime = orc.G
-        nx.set_edge_attributes(G_prime, orc_edges_dict, 'ricciCurvature')
-        # G_prime = ricciCurvature(G_prime, alpha=0, weight=None, proc=cpu_cores, edge_list=edge_list, verbose=False)
+            orc_edges_dict = orc.compute_ricci_curvature_edges(edge_list=edge_list)
+            # G_prime = orc.G
+            nx.set_edge_attributes(G_prime, orc_edges_dict, 'ricciCurvature')
 
-        if iter_ctr == 1:
-            orc_orig.G = deepcopy(orc.G)
-            G_orig = orc_orig.G
+    #         # TODO: moved above
+    #         if iter_ctr == 1:
+    #             orc_orig.G = deepcopy(orc.G)
+    #             G_orig = orc_orig.G
 
-        edge_Ricci_curv = nx.get_edge_attributes(G_prime, 'ricciCurvature')
+            edge_Ricci_curv = nx.get_edge_attributes(G_prime, 'ricciCurvature')
 
-        # sort according to increasing curvature
-        edge_Ricci_curv_sorted = sorted(edge_Ricci_curv.items(), key=operator.itemgetter(1))
-        # print(edge_Ricci_curv_sorted)
+            # sort according to increasing curvature
+            edge_Ricci_curv_sorted = sorted(edge_Ricci_curv.items(), key=operator.itemgetter(1))
+            # print(edge_Ricci_curv_sorted)
 
-        # TODO: Batch (greedy approach)
-        # rm_edge = dict()        # {edge: curv}
-        # for edge, curv in edge_Ricci_curv.items():
-        #     if curv < MIN_TOL:
-        #         rm_edge[edge] = curv
+            # TODO: Batch (greedy approach)
+            # rm_edge = dict()        # {edge: curv}
+            # for edge, curv in edge_Ricci_curv.items():
+            #     if curv < MIN_TOL:
+            #         rm_edge[edge] = curv
 
-        # dictionary of edges to remove
-        rm_edge = dict()  # {edge: ricciCurvature}
+            # dictionary of edges to remove
+            rm_edge = dict()  # {edge: ricciCurvature}
 
-        # sequential removal
-        least_curved_edge = edge_Ricci_curv_sorted[0]
+            # sequential removal
+            least_curved_edge = edge_Ricci_curv_sorted[0]
 
-        # for edge, curv in edge_Ricci_curv.items():
-        if least_curved_edge[1] < MIN_TOL:  # remove only the most negative edge ORC
-            rm_edge[least_curved_edge[0]] = least_curved_edge[1]
+            # for edge, curv in edge_Ricci_curv.items():
+            if least_curved_edge[1] < MIN_TOL:  # remove only the most negative edge ORC
+                rm_edge[least_curved_edge[0]] = least_curved_edge[1]
+                
+            # TODO change order (move after removal of edge)
+            # List of component partitions
+            component_list = list(nx.connected_components(G_prime))
+            num_components = len(component_list)
+            comp_sizes = [len(x) for x in component_list]
+            largest_cc = max(comp_sizes)
 
-        # TODO change order (move after removal of edge)
-        # List of component partitions
-        component_list = list(nx.connected_components(G_prime))
-        num_components = len(component_list)
-        comp_sizes = [len(x) for x in component_list]
-        largest_cc = max(comp_sizes)
+            # 2020.09.14 - JCS (dendrogram)
+            modularity = nx_comm.modularity(G_orig, component_list)
 
-        # 2020.09.14 - JCS (dendrogram)
-        modularity = nx_comm.modularity(G_orig, component_list)
+            partition = {"iteration": iter_ctr, "partition": component_list, "modularity": modularity}
+            partition_set = set(frozenset(i) for i in component_list)
 
-        partition = {"iteration": iter_ctr, "partition": component_list, "modularity": modularity}
-        partition_set = set(frozenset(i) for i in component_list)
-
-        if iter_ctr == 1:  # first iteration
-            # prev_partition_set = {}
-            partitions_list.append(partition)
-        else:
-            prev_partition = partitions_list[-1]["partition"]
-            prev_partition_set = set(frozenset(i) for i in prev_partition)
-
-            # check if same as previous iteration
-            if prev_partition_set != partition_set:
-                if verbose == "INFO":
-                    print("iteration: %d,\t #components: %d,\t max_component_size: %d,\t modularity: %.4f" % (
-                        partition["iteration"], len(partition["partition"]), largest_cc, partition["modularity"]))
-                elif verbose == "TRACE":
-                    print("PARTITION SPLIT: #components: %d,\t max_component_size: %d,\t modularity: %.4f" % (
-                        len(partition["partition"]), largest_cc, partition["modularity"]))
+            if iter_ctr == 1:  # first iteration
+                # prev_partition_set = {}
                 partitions_list.append(partition)
+            else:
+                prev_partition = partitions_list[-1]["partition"]
+                prev_partition_set = set(frozenset(i) for i in prev_partition)
 
-        # TODO: Batch
-        # if rm_edge:
-        #     minCurv = min(rm_edge.values())
-        #     maxCurv = max(rm_edge.values())
-        # else:
-        #     minCurv = 0
-        #     maxCurv = 0
+                # check if same as previous iteration
+                if prev_partition_set != partition_set:
+                    if verbose == "INFO":
+                        print("iteration: %d,\t #components: %d,\t max_component_size: %d,\t modularity: %.4f" % (
+                            partition["iteration"], len(partition["partition"]), largest_cc, partition["modularity"]))
+                    elif verbose == "TRACE":
+                        print("PARTITION SPLIT: #components: %d,\t max_component_size: %d,\t modularity: %.4f" % (
+                            len(partition["partition"]), largest_cc, partition["modularity"]))
+                    partitions_list.append(partition)
 
-        if verbose == "TRACE":
-            print("\nNumber of components: %i" % num_components)
-            print("Size of largest component: %i" % largest_cc)
+            # TODO: Batch
+            # if rm_edge:
+            #     minCurv = min(rm_edge.values())
+            #     maxCurv = max(rm_edge.values())
+            # else:
+            #     minCurv = 0
+            #     maxCurv = 0
 
-            str1 = "List of component sizes: "
-            str2 = ' '.join(str(x) for x in comp_sizes)
-            print(str1 + '[' + str2 + ']')
-            print("Number of deleted edges: %i" % (len(rm_edge)))
-            print("Deleted edge: ")
-            print(rm_edge)
-            # print("Removed edge curvatures: %.4f (min), %.4f (max)" % (minCurv, maxCurv))
+            if verbose == "TRACE":
+                print("\nNumber of components: %i" % num_components)
+                print("Size of largest component: %i" % largest_cc)
 
-        # remove edges simultaneously (sequential and batch)
-        G_prime.remove_edges_from(rm_edge.keys())
+                str1 = "List of component sizes: "
+                str2 = ' '.join(str(x) for x in comp_sizes)
+                print(str1 + '[' + str2 + ']')
+                print("Number of deleted edges: %i" % (len(rm_edge)))
+                print("Deleted edge: ")
+                print(rm_edge)
+                # print("Removed edge curvatures: %.4f (min), %.4f (max)" % (minCurv, maxCurv))
 
-        # Only recalculate curvature for affected edges
-        #   neighbors of u and v nodes where uv is the deleted edge
-        nodes_affected = set(node for edge in rm_edge for node in edge)
-        edges_affected = G_prime.edges(nodes_affected)
+            # remove edges simultaneously (sequential and batch)
+            G_prime.remove_edges_from(rm_edge.keys())
 
-        # TODO add affected edges where there's a direct path between the neighbors of u and v
+            # Only recalculate curvature for affected edges
+            #   neighbors of u and v nodes where uv is the deleted edge
+            nodes_affected = set(node for edge in rm_edge for node in edge)
+            edges_affected = G_prime.edges(nodes_affected)
 
-        edge_list = list(edges_affected)  # 2020.07.31 - JCS made list
+            # TODO add affected edges where there's a direct path between the neighbors of u and v
 
-        if verbose == "TRACE":
-            print("Number of affected nodes/edges: %i, %i" % (len(nodes_affected), len(edges_affected)))
+            edge_list = list(edges_affected)  # 2020.07.31 - JCS made list
+
+            if verbose == "TRACE":
+                print("Number of affected nodes/edges: %i, %i" % (len(nodes_affected), len(edges_affected)))
+                
+            # 2020.11.16 END if indent 
+        
+        # case for edge_list = [] (empty)
+        else:
+            rm_edge = []
+            # List of component partitions
+            component_list = list(nx.connected_components(G_prime))
+            num_components = len(component_list)
+            comp_sizes = [len(x) for x in component_list]
+            largest_cc = max(comp_sizes)
+
+            # 2020.09.14 - JCS (dendrogram)
+            modularity = nx_comm.modularity(G_orig, component_list)
+
+            partition = {"iteration": iter_ctr, "partition": component_list, "modularity": modularity}
+            partition_set = set(frozenset(i) for i in component_list)
+
+            if iter_ctr == 1:  # first iteration
+                # prev_partition_set = {}
+                partitions_list.append(partition)
+            else:
+                prev_partition = partitions_list[-1]["partition"]
+                prev_partition_set = set(frozenset(i) for i in prev_partition)
+
+                # check if same as previous iteration
+                if prev_partition_set != partition_set:
+                    if verbose == "INFO":
+                        print("iteration: %d,\t #components: %d,\t max_component_size: %d,\t modularity: %.4f" % (
+                            partition["iteration"], len(partition["partition"]), largest_cc, partition["modularity"]))
+                    elif verbose == "TRACE":
+                        print("PARTITION SPLIT: #components: %d,\t max_component_size: %d,\t modularity: %.4f" % (
+                            len(partition["partition"]), largest_cc, partition["modularity"]))
+                    partitions_list.append(partition)
 
         # exit condition
         if not rm_edge:  # and not in known_list
@@ -371,8 +501,17 @@ def orcci(G, weight='weight', method='Sinkhorn', edges_known=[], block_label="bl
                 print()
 
             break
+            
+    # TODO: post-process merging of partitions based on community assignments on dominant side information 
+    
+    # dominant side information merging
+    
+    
 
     return orc_orig, partitions_list  # return the original graph object with labeled nodes (G_orig)
+
+def dominant_sinfo_merge():
+    return 0
 
 
 def draw_dendrogram(partition_list, threshold=None, figsize=(8, 6), fontsize=16, verbose=False):
@@ -540,3 +679,11 @@ def find_max_modularity_partition(partitions_list):
             idx_max = idx
 
     return idx_max, mod_max
+
+
+def insert_to_dict_list(dict_list, key, val):
+    if key in dict_list:
+        dict_list[key].append(val)
+    else:
+        dict_list[key] = [val]
+        
